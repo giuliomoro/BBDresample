@@ -1,0 +1,52 @@
+clear all
+fs=44100;
+tlim=1000;
+x=[1:tlim*3];
+y=zeros(size(x));
+bbddel=256;
+bbdsize=bbddel+200;
+lfo=inline("sin(2*pi*t*100/fs)","t");
+bbd2=bbd=zeros(bbdsize,1);
+width=50;%percentage of predelay
+T1=1;
+T2b=.7;
+T2=T2b;
+w=T2*width/100;
+bbdpointer=2;
+t=1;
+flags=1;
+oldBBDevent=T1-T2;
+nextBBDevent=T1;
+nextTevent=T1;
+status=zeros(tlim*3,3);#x(floor(t)),y(floor(t))
+bbdstatus=zeros(tlim*3,3);#t,bbd(bbdpointer),bbd(bbdpointer+bbddel)
+# log=zeros(1,44100);
+c=0;
+while t<tlim
+c++;
+  # log(c++,1)=T2;
+  # t++;
+# endwhile
+# while 0
+  if flags==2 #bbdEvent
+    # printf("%.1f write bbd\n",t )
+    T2=T2b+w*lfo(t);
+    x(ceil(t));
+    bbd(bbdpointer)=lints(x(floor(t)),x(ceil(t)),mod(t,1));#linear interpolation
+    bbdpointer+=1;
+    oldBBDevent=t;
+    nextBBDevent=t+T2;
+    bbdstatus(c,:)=[t,bbd(bbdpointer-1),bbd(1+mod(bbdpointer+bbddel,bbdsize))];
+  endif
+  if flags==1
+    # printf("%.1f read bbd\n",t)
+    # y(t)=bbd( 1+mod(bbdpointer+bbddel,bbdsize) );#no interpolation
+    # if t>138 keyboard endif
+    y(t)=lints( bbd(1+mod(bbdpointer+bbddel,bbdsize))   ,   bbd(1+mod(1+bbdpointer+bbddel,bbdsize))  ,  (t-oldBBDevent)/T2 );#linear interpolation
+    nextTevent=floor(t+1); #needed to report integer value. In C a different approach should be used
+    status(c,:)=[ x(floor(t)) , y(floor(t)),T2];
+  endif
+  [t flags]=min([nextTevent nextBBDevent]);
+endwhile
+plot(status,'linewidth',8,'-',bbdstatus(:,1),bbdstatus(:,2:end),"linewidth",2)
+legend("x","y","lfo","bbdwrite","bbd","location","northwest")

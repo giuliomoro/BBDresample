@@ -1,0 +1,680 @@
+    /* resamplesubs.c - sampling rate conversion subroutines */
+// Altered by Giulio Moro in order to model the behaviour of BBD devices
+#include "resample.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+#include "smallfilter.h"
+#include "largefilter.h"
+#include "filterkit.h"
+#include "sndlibextra.h"
+#include "mt19937ar.c"
+#include "vermona.h"
+
+#define IBUFFSIZE 4096 /* Input buffer size */
+#define BBDBUCKS 512  /* Number of stages in the BBD */
+#define BBDDEL (BBDBUCKS/2) /* Number of stored samples in the BBD*/
+#define BBDOFF 100    /*padding in the BBD array */
+#define BBDSIZE (BBDDEL+2*BBDOFF) /* Total size of the BBD array*/
+#define NUMBER_OF_BBDS 3
+FLOAT bbd[NUMBER_OF_BBDS][BBDSIZE]={0};
+#define NOISEAMP 0.00040823
+
+#define MAX_SIGNAL 0.99996
+#define MIN_SIGNAL -1
+
+
+double modwidth=0;/*modwidth*/
+double BBDclock=0; /*clock frequency Fs2*/
+int bypass=0; /**/
+int preset=0;
+
+FLOAT inmin=1;
+FLOAT inmax=-1;
+FLOAT outmin=1;
+FLOAT outmax=-1;
+int mindiff=BBDSIZE;
+int maxdiff=0;
+/* CAUTION: Assumes we call this for only one resample job per program run! */
+/* return: 0 - notDone */
+/*        >0 - index of last sample */
+static int
+readData(int   infd,          /* input file descriptor */
+         int   inCount,       /* _total_ number of frames in input file */
+         FLOAT *outPtr1,      /* array receiving left chan samps */
+         FLOAT *outPtr2,      /* array receiving right chan samps */
+         int   dataArraySize, /* size of these arrays */
+         int   nChans,
+         int   Xoff)          /* read into input array starting at this index */
+{
+   int    i, Nsamps, nret;
+   static unsigned int framecount;  /* frames previously read */
+   static mus_sample_t **ibufs = NULL;
+
+   if (ibufs == NULL) {             /* first time called, so allocate it */
+      ibufs = sndlib_allocate_buffers(nChans, dataArraySize);
+      if (ibufs == NULL) {
+         fprintf(stderr, "readData: Can't allocate input buffers!\n");
+         exit(1);
+      }
+      framecount = 0;               /* init this too */
+   }
+
+   Nsamps = dataArraySize - Xoff;   /* Calculate number of samples to get */
+   outPtr1 += Xoff;                 /* Start at designated sample number */
+   outPtr2 += Xoff;
+
+   nret = mus_file_read(infd, 0, Nsamps - 1, nChans, ibufs);
+   if (nret < 0) {
+     fprintf(stderr, "readData: Can't read data!\n");
+     exit(1);
+   }     
+
+   /* NB: sndlib pads ibufs with zeros if it reads past EOF. */
+   if (nChans == 1) {
+      for (i = 0; i < Nsamps; i++)
+         *outPtr1++ = MUS_SAMPLE_TYPE_TO_FLOAT(ibufs[0][i]);
+   }
+   else {
+      for (i = 0; i < Nsamps; i++) {
+         *outPtr1++ = MUS_SAMPLE_TYPE_TO_FLOAT(ibufs[0][i]);
+         *outPtr2++ = MUS_SAMPLE_TYPE_TO_FLOAT(ibufs[1][i]);
+      }
+   }
+
+   framecount += Nsamps;
+
+   if (framecount >= (unsigned)inCount)     /* return index of last samp */
+      return (((Nsamps - (framecount - inCount)) - 1) + Xoff);
+   else
+      return 0;
+}
+
+
+#ifdef DEBUG
+static int pof = 0;             /* positive overflow count */
+static int nof = 0;             /* negative overflow count */
+#endif
+
+static INLINE HWORD WordToHword(WORD v, int scl)
+{
+    HWORD out;
+    WORD llsb = (1<<(scl-1));
+    v += llsb;          /* round */
+    v >>= scl;
+    if (v>MAX_HWORD) {
+#ifdef DEBUG
+        if (pof == 0)
+          fprintf(stderr, "*** resample: sound sample overflow\n");
+        else if ((pof % 10000) == 0)
+          fprintf(stderr, "*** resample: another ten thousand overflows\n");
+        pof++;
+#endif
+        v = MAX_HWORD;
+    } else if (v < MIN_HWORD) {
+#ifdef DEBUG
+        if (nof == 0)
+          fprintf(stderr, "*** resample: sound sample (-) overflow\n");
+        else if ((nof % 1000) == 0)
+          fprintf(stderr, "*** resample: another thousand (-) overflows\n");
+        nof++;
+#endif
+        v = MIN_HWORD;
+    }   
+    out = (HWORD) v;
+    return out;
+}
+
+
+
+
+
+//~ #define Blgt 5
+//~ #define Algt 5
+FLOAT filtiir(FLOAT x[],int lengthx, FLOAT y[], double A[], int Algt, double B[], int Blgt){
+    int n,i,iend;
+    double out=0;
+    for (n=0;n<lengthx;n++){
+        out=0;
+        for(i=0;i<Blgt;i++){
+            out+=B[i]*x[n-i];
+        }
+        for (i=1;i<Algt;i++){
+            out-=A[i]*y[n-i];
+        }
+        y[n]=out;
+    }
+}
+
+#define FIRlgt 5
+FLOAT filtfir(FLOAT x[],int lengthx, FLOAT y[]){
+double B[FIRlgt]={0.010773,0.043093,0.064640,0.043093,0.010773};
+    int n,i,iend;
+    double out=0;
+    for (n=0;n<lengthx;n++){
+        out=0;
+        iend=FIRlgt;
+        for(i=0;i<iend;i++){
+            out+=B[i]*x[n-i];
+        }
+        y[n]=out;
+    }
+}
+
+
+
+
+
+
+
+double fslow=.83;/*frequency of the slow waveform*/
+double ffast=6.16;/*frequency of the fast waveform*/
+
+double phs=0;
+double phf=0;
+
+UHWORD Xoff;
+
+void reinitLfoGen(UWORD Time, double sysFs){
+  double t=(Time/32768.0 - Xoff)/sysFs;
+  phs+=t*fslow*2*M_PI;
+  phs=fmod(phs,2*M_PI);
+  phf+= (t*ffast)*2*M_PI;
+  phf=fmod(phf,2*M_PI);
+}
+
+double lfoGen(int channel, UWORD uTime, double sysFs){
+    extern int preset;
+    double Time=(uTime-(Xoff<<Np))/sysFs;
+    static double pi2=2*M_PI/32768.0;
+    static double ph1=2*M_PI/3;/*phase of second modulator*/
+    static double ph2=2*M_PI*2/3;/*phase of third modulator*/
+    double samp=1;/*gain reduction of slow waveform*/
+    double famp=1*68.0/180.0; /*gain reduction of fast waveform*/
+    switch (preset){
+    case 0 : /*slow*/
+        switch (channel){
+        case 0 :
+            return samp*sin(pi2*Time*fslow+phs);
+        case 1 : 
+            return 0;
+        case 2 :
+            return 0;
+        }
+    case 1 : /*chorus 1*/
+        switch (channel){
+        case 0:
+            return samp*sin(pi2*Time*fslow+phs);
+        case 1:
+            return samp*sin(pi2*Time*fslow+phs+ph1);
+        case 2:
+            return samp*sin(pi2*Time*fslow+phs+ph2);
+        }
+    case 2 : /*chorus 2*/
+        switch (channel){
+        case 0 :
+            return .5*sin(pi2*Time*fslow+phs) + famp/2*sin(pi2*Time*ffast+phf);
+        case 1 :
+            return .5*sin(pi2*Time*fslow+phs+ph1) + .5*famp*sin(pi2*Time*ffast+phf+ph1);
+        case 2 : 
+            return .5*sin(pi2*Time*fslow+phs+ph2) + famp/2*sin(pi2*Time*ffast+phf+ph2);
+        }
+    case 3: /*fast*/
+        switch (channel){
+        case 0:
+            return sin(pi2*ffast*Time+phf);
+        case 1: 
+            return 0;
+        case 2:
+            return 0;
+        }
+    }
+    fprintf(stdout,"unknown preset number in lfoGen");
+    exit(-1);
+}
+
+/* Sampling rate conversion subroutine */
+
+#include "wash1.h"
+double washtable(double a){/*WAVESHAPER look up table of length WAVESHAPER_N must be declared in included files.*/
+  if (a>MAX_SIGNAL) return WAVESHAPER[WAVESHAPER_N-1];/*a must be limited between MAX_SIGNAL and MIN_SIGNAL, otherwise it is clipped*/
+  if (a<MIN_SIGNAL) return WAVESHAPER[0];
+  return WAVESHAPER[(int)((a+1)/2.0*WAVESHAPER_N+.5)];
+}
+
+double washcoeff[WASHCOEFF_N]={0.074999901728955,0.017679532761088,0.912890447963023,-0.005893177587029};
+//~ double washcoeff[WASHCOEFF_N]={6,5,4,3,2,1,0};
+
+double washcompute(double a){
+  int i;
+  double out=washcoeff[WASHCOEFF_N-1];
+  for(i=1;i<WASHCOEFF_N;i++){
+    out+=pow(a,i)*washcoeff[WASHCOEFF_N-i-1];
+  }
+  return out;
+}
+
+int SrcUD(
+FLOAT X[],/*pointer to the first element to be processed in the input buffer*/
+            FLOAT Y[],/*pointer to the first element to be written in the input buffer*/
+            UWORD *Time,/*the time accumulator*/
+            UHWORD Nx,/*number of samples to process*/
+            UHWORD Nwing,/*number of samples in the filter table*/
+            UHWORD LpScl,/*unitary gain rescale factor of the filter table*/
+            HWORD Imp[],/*pointer to a table of filter values*/
+            HWORD ImpD[],/*pointer to a table of differences filter values*/
+            BOOL Interp, /*use filter interpolation?*/
+            FLOAT X2[], /*pointer to the first element of the external lfo buffer*/
+            int channels, /*number of channels to process*/
+            double rescale,/*rescale coefficient for output samples*/
+            BOOL onboard,/*use onboard lfo?*/
+            double sysFs,/*system sampling rate*/
+            double BBDFs)/*BBD clock frequency*/
+{ 
+  extern double BBDclock;
+  extern double modwidth;
+  extern int preset;
+  static BOOL init =0;
+  int bbdp=BBDOFF, bbdsize=BBDSIZE, bbddel=BBDDEL;/*debug*/
+  double z0,z1,w;//used for linear interpolation
+  static double T2f;//step through bbd samples, floating point
+  static UWORD T2i;//step through bbd samples, fixed point
+  static UWORD T2[NUMBER_OF_BBDS];
+  static double T2lfo;
+  static double sclF;//initialized below
+  double width=modwidth/100; // predelay in the range (0,1]
+  static int BBDindex[NUMBER_OF_BBDS]={0};
+  int ch,rread;
+  static double lfo=0;
+  double v,scl;
+  static short comp=(1<<sizeof(short)*8-1)-1;/*maximum short value*/
+      UWORD static t;
+  static c=-1;
+  double(*waveshaper)(double);
+  waveshaper=&washcompute;
+  //~ waveshaper=&washtable;
+  //time variables
+  static UWORD oldBBDevent[NUMBER_OF_BBDS];//initialized below
+  static UWORD nextBBDevent[NUMBER_OF_BBDS];//initialized below
+  static UWORD nextTevent;
+  double dhw; UWORD dhbw;
+  
+  if (!init){//first time initialization
+    for (ch=0;ch<channels;ch++){
+      oldBBDevent[ch]+=*Time-T2[0];
+      nextBBDevent[ch]+=*Time;
+      T2[ch]=T2i;
+    }
+    initNoise(0);/*seed noise generator*/ //time(NULL)
+    T2f=sysFs/BBDFs;
+    T2i==(UWORD)(T2f*(1<<Np)+.5);
+    init=1;
+<<<<<<< .mine
+    scl=MIN(1,BBDFs/sysFs);
+=======
+    //~ scl=LpScl/32768.0;
+>>>>>>> .r70
+  } 
+  else{ //reinizialization
+    for (ch=0;ch<channels;ch++){
+      oldBBDevent[ch]+=*Time-nextTevent;
+      nextBBDevent[ch]+=*Time-nextTevent;
+    }
+  }
+  int Xp;
+  UWORD startTime=*Time;
+  UWORD newTime,wi,endTime=0;
+  //~ if (factor < 1) LpScl = LpScl*factor + 0.5;
+
+  FLOAT *Ystart = Y;
+    for (ch=0;ch<channels;ch++){
+    *Time=startTime;
+    nextTevent=*Time;
+    Y=Ystart;
+    while ( *Time-startTime >>Np < Nx ){
+      Xp = *Time>>Np;     /* index of X[] to current input sample */
+      if (*Time==nextBBDevent[ch]){
+        if (onboard)
+          lfo=lfoGen(ch,*Time,sysFs);
+        else lfo=X2[Xp]; /*external lfo, no interpolation is performed here*/
+        T2lfo= T2f/(width*lfo+1);
+        //~ dhw = MIN(Npc, Npc/T2lfo);  /* Filter sampling period min(Fs,Fs')*/ // Npc > Npc/T2lfo Fs'/Fs
+        //~ dhw = Npc/T2lfo;  /* Filter sampling period min(Fs,Fs')*/ // Npc > Npc/T2lfo Fs'/Fs
+        dhw = Npc;  /* Filter sampling period min(Fs,Fs')*/
+        dhbw = dhw*(1<<Na) + 0.5;     /* Fixed-point representation*/
+        T2[ch]=(UWORD)( (T2lfo)*(1<<Np) +.5);
+        
+
+        BBDindex[ch]=(BBDindex[ch]+1)%bbdsize; //increment in the circular buffer
+                        z0=X[*Time>>Np];z1=X[1+(*Time>>Np)];w=(*Time&Pmask)/32768.0;
+                        //~ v = z0+(z1-z0)*w;//linear interpolation
+        
+        v = FilterUD(Imp, ImpD, Nwing, Interp, Xp, (HWORD)(*Time&Pmask),-1, dhbw, X,0);  /* Perform left-wing inner product */
+        v += FilterUD(Imp, ImpD, Nwing, Interp, Xp+1,(HWORD)((((*Time)^Pmask)+1)&Pmask),1, dhbw, X,0);  /* Perform right-wing inner product */
+        v=v/3;
+        bbd[ch][BBDindex[ch]]= /* waveshaper(v) */  v + noise()*NOISEAMP;/*noise*10^(-70/20)*/
+        oldBBDevent[ch]=*Time;
+        nextBBDevent[ch]=*Time + T2[ch];
+      }
+      if (*Time==nextTevent){
+        //~ dhw = MAX(Npc, T2lfo*Npc);  /* Filter sampling period min(Fs,Fs')*/
+        //~ dhw = MIN(Npc,T2lfo*Npc);  /* Filter sampling period min(Fs,Fs')*/ // Npc < T2lfo*Npc Fs/Fs'
+        dhw = Npc*T2lfo;  /* Filter sampling period min(Fs,Fs')*/
+        //~ dhw=Npc;
+        dhbw = dhw*(1<<Na) + 0.5;     /* Fixed-point representation*/
+        
+        //~ printf("%.3f read bbd\n",*Time/32768.0);
+        rread=(BBDindex[ch]-bbddel+bbdsize-1)%bbdsize;
+        z0=bbd[ch][ rread ];z1=bbd[ch][ (rread+1)%bbdsize];
+        w=(*Time-oldBBDevent[ch])/(double)(T2[ch]);
+        wi=(UWORD)(w*32767+.5);
+        //~ v=(z0+(z1-z0)*w); //linear interpolation
+        v = FilterUD(Imp, ImpD, Nwing, Interp, rread, (HWORD)(wi&Pmask),-1, dhbw, bbd[ch],BBDSIZE);  /* Perform left-wing inner product */
+        v += FilterUD(Imp, ImpD, Nwing, Interp, (rread+1)%bbdsize,(HWORD)((((wi)^Pmask)+1)&Pmask),1, dhbw, bbd[ch],BBDSIZE);  /* Perform right-wing inner product */
+<<<<<<< .mine
+        v=scl*.8*T2lfo*v/rescale;
+        outmin=MIN(outmin,v);
+        outmin=MAX(outmax,v);
+        *Y++=*Y+ v;
+=======
+ 
+                                      c++;
+        *Y++=*Y+ .2*v/rescale*2;
+>>>>>>> .r70
+        //~ *Y+=bbd[ch][rread];
+        //~ *Y=(1/T2lfo -2)*.5;
+        //~ *Y=lfo;
+        nextTevent=*Time+(1<<Np); //integer
+        //~ if (ch==channels-1) Y++;
+      }
+      *Time=MIN(nextTevent,nextBBDevent[ch]);/*min(nextBBDevent[],nextTevent[])*/
+    }
+    endTime=MAX(endTime,*Time);
+  }
+  reinitLfoGen(*Time,sysFs);
+  t=endTime;
+  return (Y - Ystart);        /* Return the number of output samples */
+}
+
+static int err_ret(char *s)
+{
+    fprintf(stderr,"resample: %s \n\n",s); /* Display error message  */
+    return -1;
+}
+
+
+static int resampleWithFilter(  /* number of output samples returned */
+    double factor,              /* factor = outSampleRate/inSampleRate */
+    int infd,                   /* input and output file descriptors */
+    int outfd,
+    int inCount,                /* number of input samples to convert */
+    int outCount,               /* number of output samples to compute */
+    int nChans,                 /* number of sound channels (1 or 2) */
+    BOOL interpFilt,            /* TRUE means interpolate filter coeffs */
+    HWORD Imp[], HWORD ImpD[],
+    UHWORD LpScl, UHWORD Nmult, UHWORD Nwing)
+{
+    extern int preset;
+    extern double RECfilter_A[];
+    extern double RECfilter_B[];
+    extern double AAfilter_A[];
+    extern double AAfilter_B[];
+
+    static UWORD Time;          /* Current time/pos in input sample */
+    UHWORD Xp, Xread;
+    //~ int OBUFFSIZE = (int)(((double)IBUFFSIZE)*factor+2.0)*10;
+    int OBUFFSIZE=IBUFFSIZE;
+    FLOAT X1[IBUFFSIZE+AAfilter_Blgt];
+    FLOAT Y1[IBUFFSIZE+RECfilter_Blgt]={0}; /* I/O buffers */
+    FLOAT X2[IBUFFSIZE];/* I/O buffers */
+    static FLOAT X3[IBUFFSIZE+AAfilter_Algt]={0};/* I/O buffers */
+    static FLOAT Y2[IBUFFSIZE+RECfilter_Algt]={0}; /* I/O buffers */
+    UHWORD Nout, Nx;
+    int i, Ycount, last;
+    
+    mus_sample_t **obufs = sndlib_allocate_buffers(1, OBUFFSIZE+RECfilter_Algt);
+    if (obufs == NULL)
+        return err_ret("Can't allocate output buffers");
+
+    /* Account for increased filter gain when using factors less than 1 */
+    //~ if (factor < 1)
+      //~ LpScl = LpScl*factor + 0.5;
+
+    /* Calc reach of LP filter wing & give some creeping room */
+    Xoff = ((Nmult+1)/2.0) * MAX(1.0,1.0/factor) + 200;
+
+    if (IBUFFSIZE < 2*Xoff)      /* Check input buffer size */
+      return err_ret("IBUFFSIZE (or factor) is too small");
+
+    Nx = IBUFFSIZE - 2*Xoff;     /* # of samples available to each iteration of the src */
+    
+    last = 0;                   /* Have not read last input sample yet */
+    Ycount = 0;                 /* Current sample and length of output file */
+    Xp = Xoff;                  /* Current "now"-sample pointer for input */
+    Xread = Xoff;               /* Position in input array to read into */
+    for(i=0;i<3;i++)
+        Time = (Xoff<<Np);          /* Current-time pointer for converter */
+    
+    for (i=0; i<Xoff; X1[i++]=0); /* Need Xoff zeros at begining of sample */
+    for (i=0; i<Xoff; X2[i++]=0); /* Need Xoff zeros at begining of sample */
+
+    do {
+        if (!last)              /* If haven't read last sample yet */
+        {
+            last = readData(infd, inCount, X1, X2, IBUFFSIZE, 
+                            nChans, (int)Xread);
+            if (last && (last-Xoff<Nx)) { /* If last sample has been read... */
+                Nx = last-Xoff+1; /* ...calc last sample affected by filter */
+                if (Nx <= 0)
+                  break;
+            }
+        }
+        /* Resample stuff in input buffer */
+        //~0: "slow": only the slow sinewave is used as CV for the chorus. Only the output of the first stage is used
+        //~ and mixed at a 1:1 rate with the "direct" signal
+        //~1: "chor1": only the slow sinewave is used as CV for the chorus, though this time all of the three stages
+        //~ are used, and their outputs are mixed together a a 1:1:1 rate
+        //~2: "chor2": the CV waveform is the sum of the slow and fast sinewaves, all three stages are used and their
+        //~ outputs are mixed together at a 1:1:1 rate
+        //~3: "fast": the CV waveform consists of the fast sine only.
+        //~ Only the output of the first stage is used and mixed at a 1:1 rate with the "direct" signal(the schematics
+        //~ read "vibrato" for this preset, though it is in fact a chorus)
+        int channels,direct,channel,dryonly=0,onboard=1;
+        static init=0;
+        double rescale;
+      if (!init)
+        switch (preset){
+        case 0 :/*slow*/
+        case 3 :/*fast*/
+            channels=1;
+            direct=1;
+            rescale=2;
+            break;
+        case 1:/*chor1*/
+        case 2:/*chor2*/
+            channels=3;
+            direct=0;
+            rescale=3;
+            break;
+        case 4:/*slow wet only*/
+            preset=0;
+            channels=1;
+            direct=0;
+            rescale=1;/*should be 1. Debug*/
+            break;
+        case 5:/*fast wet only*/
+            preset=3;
+            channels=1;
+            direct=0;
+            rescale=1;/*should be 1. Debug*/
+            break;
+        case 6: /*dry only*/
+            channels=1;
+            direct=1;
+            rescale=1;/*should be 1. Debug*/
+            dryonly=1;
+            preset=0;
+            break;
+        case 7:  /*external lfo wet only*/
+            channels=1;
+            direct=0;
+            rescale=1;
+            onboard=0;
+            break;
+        case 8:/*external lfo mix 1:1*/
+            channels=1;
+            direct=1;
+            rescale=2;
+            onboard=0;
+            break;
+        }
+        init=1;
+
+        //~ filtiir(&X1[AAfilter_Blgt],Nout,&X3[AAfilter_Algt],AAfilter_A,AAfilter_Algt,AAfilter_B,AAfilter_Blgt);
+
+        memset(&Y1[RECfilter_Blgt], 0, (IBUFFSIZE)*sizeof(Y1[0]));
+        Nout=SrcUD(X1,Y1+RECfilter_Blgt,&Time,Nx,Nwing,LpScl,Imp,ImpD,interpFilt,X2,channels,rescale,onboard,44100,63500 );
+        
+        //~ for(i=0;i<AAfilter_Algt;i++){
+            //~ X3[i]=X3[i+Nout];/*copies outputs of the filter that must be reused*/
+        //~ }
+        //~ for(i=0;i<AAfilter_Blgt;i++){
+            //~ X1[i]=X1[i+Nout];/*copies inputs of the filter that must be reused*/
+        //~ }
+        
+        if (direct && !dryonly){ /*sums direct signal to the mix*/
+            for (i=0;i<IBUFFSIZE;i++){
+                Y1[i+RECfilter_Blgt]+=X1[Xoff+i]/rescale;
+            }
+        }
+        if (direct && dryonly){ /*overwrites the mix with the  direct signal. it's a debug hack*/
+            for (i=0;i<IBUFFSIZE;i++){
+                Y1[i+RECfilter_Blgt]=X1[Xoff+i]/rescale;
+            }
+        }
+        
+
+        Xp=Time>>15;
+        Time=(Time&Pmask) + (Xoff<<Np);
+        //~ if  (Time>>Np!= 17 || Nout!=4062 || Xp!=4079)
+            //~ {printf("\nTime is: %u,%05u",Time>>Np,Time&Pmask);printf("\nNout is: %u",Nout );printf("\nXp is : %u\n\n\n",Xp);fflush(stdout);}
+        for (i=0; i<IBUFFSIZE-Xp+Xoff; i++) { /* Copy part of input signal */
+            X1[i] = X1[i+Xp-Xoff]; /* that must be re-used */
+            X2[i] = X2[i+Xp-Xoff];
+        }
+        if (last) {             /* If near end of sample... */
+            last -= Xp;         /* ...keep track were it ends */
+            if (!last)          /* Lengthen input by 1 sample if... */
+              last++;           /* ...needed to keep flag TRUE */
+        }
+        Xread = i;              /* Pos in input buff to read new data into */
+        Xp = Xoff;
+        
+        Ycount += Nout;
+        if (Ycount>outCount) {
+            Nout -= (Ycount-outCount);
+            Ycount = outCount;
+        }
+        if (!bypass)
+          filtiir(&Y1[RECfilter_Blgt],Nout,&Y2[RECfilter_Algt],RECfilter_A,RECfilter_Algt,RECfilter_B,RECfilter_Blgt);/*applies iir filter*/
+        else for (i = 0; i < Nout; i++) Y2[i+RECfilter_Algt]=Y1[i+RECfilter_Blgt];/*doesn't apply filter, just copies the samples*/
+        
+        for(i=0;i<RECfilter_Algt;i++){
+            Y2[i]=Y2[i+Nout];/*copies outputs of the filter that must be reused*/
+        }
+        for(i=0;i<RECfilter_Blgt;i++){
+            Y1[i]=Y1[i+Nout];/*copies inputs of the filter that must be reused*/
+        }
+        int warn=1;
+        int over=0;
+        for (i = 0; i < Nout; i++) {
+          obufs[0][i] = FLOAT_TO_MUS_SAMPLE_TYPE(Y2[i+RECfilter_Algt]);
+          if ( Y2[i+RECfilter_Algt]>=MAX_SIGNAL ){
+            over=1;
+            obufs[0][i]=MUS_SAMPLE_MAX;
+          }
+          else if (Y2[i+RECfilter_Algt]<MIN_SIGNAL ){
+            over=1;
+            obufs[0][i]=MUS_SAMPLE_MIN;
+          }
+        }
+        if (warn==1 && over==1){
+          warn=0;
+          fprintf(stderr, "***** clipping occurred while writing the output file********");
+        }
+
+        /* NB: errors reported within sndlib */
+        mus_file_write(outfd, 0, Nout - 1, 1, obufs);
+
+        printf(".");
+        //~ fflush(stdout);
+
+    } while (Ycount<outCount&&Nout!=0); /* Continue until done */
+
+    return(Ycount);             /* Return # of samples in output file */
+}
+
+int resample(                   /* number of output samples returned */
+    double factor,              /* factor = Sndout/Sndin */
+    int    infd,                /* input and output file descriptors */
+    int    outfd,
+    int inCount,                /* number of input samples to convert */
+    int outCount,               /* number of output samples to compute */
+    int nChans,                 /* number of sound channels (1 or 2) */
+    BOOL interpFilt,            /* TRUE means interpolate filter coeffs */
+    int fastMode,               /* 0 = highest quality, slowest speed */
+    BOOL largeFilter,           /* TRUE means use 65-tap FIR filter */
+    char *filterFile           /* NULL for internal filter, else filename */
+)
+{   
+    UHWORD LpScl;               /* Unity-gain scale factor */
+    UHWORD Nwing;               /* Filter table size */
+    UHWORD Nmult;               /* Filter length for up-conversions */
+    HWORD *Imp=0;               /* Filter coefficients */
+    HWORD *ImpD=0;              /* ImpD[n] = Imp[n+1]-Imp[n] */
+
+#ifdef DEBUG
+    /* Check for illegal constants */
+    if (Np >= 16)
+      return err_ret("Error: Np>=16");
+    if (Nb+Nhg+NLpScl >= 32)
+      return err_ret("Error: Nb+Nhg+NLpScl>=32");
+    if (Nh+Nb > 32)
+      return err_ret("Error: Nh+Nb>32");
+#endif
+    
+    /* Set defaults */
+
+    if (filterFile != NULL && *filterFile != '\0') {
+        if (readFilter(filterFile, &Imp, &ImpD, &LpScl, &Nmult, &Nwing))
+          return err_ret("could not find filter file, "
+               "or syntax error in contents of filter file");
+    } else if (largeFilter) {
+        Nmult = LARGE_FILTER_NMULT;
+        Imp = LARGE_FILTER_IMP;         /* Impulse response */
+        ImpD = LARGE_FILTER_IMPD;       /* Impulse response deltas */
+        LpScl = LARGE_FILTER_SCALE;     /* Unity-gain scale factor */
+        Nwing = LARGE_FILTER_NWING;     /* Filter table length */
+    } else {
+        Nmult = SMALL_FILTER_NMULT;
+        Imp = SMALL_FILTER_IMP;         /* Impulse response */
+        ImpD = SMALL_FILTER_IMPD;       /* Impulse response deltas */
+        LpScl = SMALL_FILTER_SCALE;     /* Unity-gain scale factor */
+        Nwing = SMALL_FILTER_NWING;     /* Filter table length */
+    }
+#if DEBUG
+    fprintf(stderr,"Attenuating resampler scale factor by 0.95 "
+            "to reduce probability of clipping\n");
+#endif
+    LpScl *= 0.95;
+    fprintf(stderr,"di=[" );
+    int ret= resampleWithFilter(factor,infd,outfd,inCount,outCount,nChans, 
+                              interpFilt, Imp, ImpD, LpScl, Nmult, Nwing);
+    fprintf(stderr,"];");
+    printf("\nLPSCL: %d\n",LpScl);
+    printf("\n# outmin: %f, outmax: %f\n",1/outmin,1/outmax);
+    //~ printf("\n# mindiff: %d, maxdiff: %d\n",mindiff,maxdiff);
+    //~ printf("\n# %d",MUS_SAMPLE_BITS);
+    return ret;
+}

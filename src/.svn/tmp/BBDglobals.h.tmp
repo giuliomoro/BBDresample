@@ -1,0 +1,8 @@
+extern double modwidth;
+extern double BBDclock; /*clock frequency Fs2*/
+extern int bypass; /*bypass filters?*/
+extern int preset;/*preset number*/
+<<<<<<< .mine
+extern double gain;
+=======
+extern double gain;>>>>>>> .r77

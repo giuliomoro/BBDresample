@@ -1,0 +1,143 @@
+Stabylizing the drift in differences between read and write pointers,
+try to get some kind of unitary gain
+use WORD or double all during the computation
+apply the iir into the sinc.
+
+
+the while loop in SrcUD moves by Ts2 steps to store samples in the bbd. The innermost while loop (which reads from the bbd) should have an independent clock <=the other.
+
+immediate to do's:
+- resample Y
+- in order to reduce jitter, keep a floating point time register to convert to fixed point at each iteration
+
+a consideration about rescaling factor will be strongly needed
+
+dhb should be changed in the filterUD function to  achieve a variable step through the IR
+
+The SrcUD must have a limited Nx number of input samples to work on, so Time-startTime must be less than Nx. Furthermore, the Xoff should be computed on the base of the actual Fs.
+
+- what are zero pads used for : they are needed to start resampling at the very first sample of the input file. Zero pads are given only at initialization of array
+- how copy between iterations works : copies Xoff samples in place of the zero pads, and Xoff samples to resample using the first Xoff's.
+- OBUFFSIZE could be enlarged at one's taste 
+
+
+resample.c	Sampling-rate conversion program.
+
+
+resamplesubs.c	Subroutines used by resample.
+in resamplesubs:
+  DELETE: SrcLinear, SrcUp, resampleFast
+  resamplewithfilter()
+    edit to always call srcud /* doing so will result in strange behaviour and duplicated processing when downsampling
+    DELETE(       if (nChans==2) Nout=SrcUD(X2,Y2,factor,&Time2,Nx,Nwing,LpScl,Imp,ImpD,interpFilt);)
+    remove references to time2 or X2for (i=0; i<Xoff; X2[i++]=0); /* Need Xoff zeros at begining of sample */
+                    if (nChans==2)
+              X2[i] = X2[i+Xp-Xoff]; /* that must be re-used */
+    
+  resample() 
+    DELETE if (fastmode)
+
+static int SrcUD called by resampleWithFilter in resamplesubs.c(
+                ( HWORD X[]
+                  HWORD Y[] 
+                  double factor resampling factor
+                  UWORD *Time,
+                  UHWORD Nx number of samples to process in each iteration
+                  UHWORD Nwing length of the impulse response
+                  UHWORD LpScl, normalization factor
+                  HWORD Imp[]  impulse response
+                  HWORD ImpD[]  impulse response differences
+                  BOOL Interp) uses filter interpolation? must be TRUE
+          thoughts about srcUD:
+          - for A/D a variable time axis is needed, so we won't use dt and dtb but an arbitrary time axis array
+
+static int resampleWithFilter called by resample in resamplesubs , resample is an almost transparent functions which is an intermediate between resample.c's main call and resampleWithFilter
+                        (  /* number of output samples returned */
+                        double factor,              /* factor = outSampleRate/inSampleRate */
+                        int infd,                   /* input and output file descriptors */
+                        int outfd,
+                        int inCount,                /* number of input samples to convert */
+                        int outCount,               /* number of output samples to compute */calculated in resample.c main() as round(incount*factor)
+                        int nChans,                 /* number of sound channels (1 or 2) */
+                        BOOL interpFilt,            /* TRUE means interpolate filter coeffs */
+                        HWORD Imp[], HWORD ImpD[],
+                        UHWORD LpScl, UHWORD Nmult, UHWORD Nwing)
+
+
+filterkit.c	Library for filter design, application, and file management.
+
+ * FilterUD() - Applies a filter to a given sample when up- or down-converting
+
+WORD FilterUD called by srcUD in resamplesubs.c
+          HWORD Imp[], impulse response
+          HWORD ImpD[], impulse response difference
+          UHWORD Nwing, length of the impulse response
+          BOOL Interp, uses filter interpolation? must be TRUE
+          HWORD *Xp pointer to the current sample 
+          HWORD Ph called as (HWORD)(*Time&Pmask) , it is the phase through the input samples; Pmask is 111111111111111, this call just passes the last two fields of the time register
+          HWORD Inc if ==1 doing right wing, if ==-1 doing left wing
+          UHWORD dhb fixed point step through filter impulse response (depends on the chosen cutoff)
+          
+          thoughts about filterud :
+          -in the future, instead of passing dhb, we'd better pass an array of time values corresponding to the tieme of previous and following samples used in the interpolation. As for now we can assume time constant in each interpolation
+          - 
+         
+         
+void printbits(unsigned char v) {int i;for(i = 7; i >= 0; i--) putchar('0' + ((v >> i) & 1));}         
+         
+from resample.h:
+#define Nhc       8 
+#define Na        7
+#define Np       (Nhc+Na)
+#define Npc      (1<<Nhc) number of filter values per zero crossing 
+#define Amask    ((1<<Na)-1)
+#define Pmask    ((1<<Np)-1)
+#define Nh       16
+#define Nb       16
+#define Nhxn     14
+#define Nhg      (Nh-Nhxn)
+#define NLpScl   13
+*
+ * Npc - is the number of look-up values available for the lowpass filter
+ *    between the beginning of its impulse response and the "cutoff time"
+ *    of the filter.  The cutoff time is defined as the reciprocal of the
+ *    lowpass-filter cut off frequence in Hz.  For example, if the
+ *    lowpass filter were a sinc function, Npc would be the index of the
+ *    impulse-response lookup-table corresponding to the first zero-
+ *    crossing of the sinc function.  (The inverse first zero-crossing
+ *    time of a sinc function equals its nominal cutoff frequency in Hz.)
+ *    Npc must be a power of 2 due to the details of the current
+ *    implementation. The default value of 512 is sufficiently high that
+ *    using linear interpolation to fill in between the table entries
+ *    gives approximately 16-bit accuracy in filter coefficients.
+ *
+ * Nhc - is log base 2 of Npc.
+ *
+ * Na - is the number of bits devoted to linear interpolation of the
+ *    filter coefficients.
+ *
+ * Np - is Na + Nhc, the number of bits to the right of the binary point
+ *    in the integer "time" variable. To the left of the point, it indexes
+ *    the input array (X), and to the right, it is interpreted as a number
+ *    between 0 and 1 sample of the input X.  Np must be less than 16 in
+ *    this implementation.
+ *
+ * Nh - is the number of bits in the filter coefficients. The sum of Nh and
+ *    the number of bits in the input data (typically 16) cannot exceed 32.
+ *    Thus Nh should be 16.  The largest filter coefficient should nearly
+ *    fill 16 bits (32767).
+ *
+ * Nb - is the number of bits in the input data. The sum of Nb and Nh cannot
+ *    exceed 32.
+ *
+ * Nhxn - is the number of bits to right shift after multiplying each input
+ *    sample times a filter coefficient. It can be as great as Nh and as
+ *    small as 0. Nhxn = Nh-2 gives 2 guard bits in the multiply-add
+ *    accumulation.  If Nhxn=0, the accumulation will soon overflow 32 bits.
+ *
+ * Nhg - is the number of guard bits in mpy-add accumulation (equal to Nh-Nhxn)
+ *
+ * NLpScl - is the number of bits allocated to the unity-gain normalization
+ *    factor.  The output of the lowpass filter is multiplied by LpScl and
+ *    then right-shifted NLpScl bits. To avoid overflow, we must have 
+ *    Nb+Nhg+NLpScl < 32.
